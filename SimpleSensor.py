@@ -18,6 +18,8 @@ Coordinates are screen-like, i.e. x=0, y=0 is top, left corner
 This is a simple, deterministic sensor, which can detect
 the presence of the object based on euclidian distance
 and returns 1 if the object was detected or 0 otherwise
+Example: PIR (passive infrared) sensors, ~$10, ceiling mounted,
+in 5 m heigth, with a nominal range of 10 m (radius)
 """
 class Sensor():
     def __init__(self, x, y, r):
@@ -109,9 +111,9 @@ class Person():
         self.vx = dx / t
         self.vy = dy / t
 
-    def step(self):
-        self.x += self.vx
-        self.y += self.vy
+    def step(self, dt):
+        self.x += self.vx * dt
+        self.y += self.vy * dt
 
     def randpos(self, side, room):
         if side == 'N':
@@ -131,8 +133,9 @@ class Person():
 """
 Episodes with only one person in a room
 """
-def episode(room):
+def episode(room, dt):
     person = Person(room)
+    dtms = int(dt * 1000)
     #print('Start at', person.x, person.y)
     rimg = room.draw()
     while room.in_range(person.x, person.y):
@@ -140,9 +143,9 @@ def episode(room):
         det = room.detect(person.x, person.y)
         room.draw_detects(cimg, det, [person])
         cv2.imshow('room', cimg)
-        if cv2.waitKey(25) & 0xFF == ord('q'):
+        if cv2.waitKey(dtms) & 0xFF == ord('q'):
             break
-        person.step()
+        person.step(dt)
 
 def rand_room(x, y, n, r):
     sensors = []
@@ -183,39 +186,113 @@ def comb_detect_eq(det1, det2):
 
 """
 Experiment with many persons traversing a square
+- room: simulation room (or square)
+- sen_x: number of sensors in the grid in horizontal direction
+- sen_y: number of sensors in the grid in vertical direction
+- pers_freq: frequency of a new person (per second)
+- steps: similation steps
+- maxtp: max traced persons
+- history: number of kept input sensors frames
+- dt: simulation time step
+- draw: show the animation
+- timescale: when drawing, how fast to simulate (1: real time, < 1: faster)
 """
-def square(room, time):
-    rimg = room.draw()
-    rest = np.random.poisson(lam=time)
+def square(room, sen_x, sen_y, pers_freq, steps=1000, maxtp=32, history=16, draw=False, dt=0.04, timescale=1.):
+    # This "time" must not be multiplied by the timescale
+    # due to how the person generation works
+    ptime = 1. / pers_freq
+    # This is the simulation step time
+    dt = dt * timescale
     persons = []
-    lp = 0
-    while True:
-        cimg = rimg.copy()
-        rest -= 1
+    if draw:
+        lp = 0
+        rimg = room.draw()
+        dtms = int(dt * 1000)
+    # Tensors to collect data: person mask (valid persons), sensor reading
+    # and ground truth, which keeps the position (x, y) per tracked person
+    M = np.zeros((steps, maxtp), dtype=np.float32)
+    X = np.zeros((steps, sen_x, sen_y, history), dtype=np.float32)
+    Y = np.zeros((steps, maxtp, 2), dtype=np.float32)
+    pmask = np.zeros(maxtp, dtype=np.float32)
+    hX = []
+    for _ in range(history):
+        deta = np.zeros((sen_x, sen_y), dtype=np.float32)
+        hX.append(deta)
+    rest = np.random.poisson(lam=ptime)
+    for i in range(steps):
+        if i % 10 == 0:
+            print('step', i)
+        rest -= dt
         if rest < 0:
             p = Person(room)
-            persons.append(p)
-            rest = np.random.poisson(lam=time)
+            # Find a place for the new person
+            free = None
+            k = 0
+            while k < maxtp:
+                if pmask[k] == 0.:
+                    pmask[k] = 1.
+                    free = k
+                    break
+                else:
+                    k += 1
+            persons.append((p, free))
+            rest += np.random.poisson(lam=ptime)
         det = []
-        rps = []
-        for p in persons:
+        for p, k in persons:
+            # Detect every person
             det = comb_detect(det, room.detect(p.x, p.y))
-            p.step()
+            if k is not None:
+                # Ground truth (this one is traced)
+                Y[i, k, 0] = p.x
+                Y[i, k, 1] = p.y
+        #print('GT ok')
+        if det == []:
+            deta = np.zeros((sen_x, sen_y), dtype=np.float32)
+        else:
+            deta = np.array(det, dtype=np.float32)
+            deta = np.reshape(deta, (sen_x, sen_y))
+        hX.append(deta)
+        hX = hX[1:]
+        #print('deta ok')
+#        # Debug:
+#        for h in hX:
+#            print(h.shape)
+        X[i, :, :, :] = np.stack(hX, axis=2)
+        #print('stack ok')
+        M[i, :] = pmask
+        if draw:
+            cimg = rimg.copy()
+            room.draw_detects(cimg, det, persons)
+            cv2.imshow('room', cimg)
+            if cv2.waitKey(dtms) & 0xFF == ord('q'):
+                break
+        rps = []
+        for p, k in persons:
+            p.step(dt)
             if room.in_range(p.x, p.y):
-                rps.append(p)
-        room.draw_detects(cimg, det, persons)
-        cv2.imshow('room', cimg)
-        if cv2.waitKey(25) & 0xFF == ord('q'):
-            break
+                rps.append((p, k))
+            elif k is not None:
+                # Delete from mask if traced
+                pmask[k] = 0.
+        #print('pmask ok')
         persons = rps
-        if len(persons) != lp:
+        if draw and len(persons) != lp:
             lp = len(persons)
             print(lp, 'persons')
+    return X, M, Y
 
 if __name__ == '__main__':
 #    #room = rand_room(100, 150, 100, 15)
-    room = grid_room(300, 150, 20, 10, 25)
+    # 100mx50m area with 72 sensors (grid)
+    width = 100
+    height = 50
+    sen_x = 12
+    sen_y = 6
+    sen_r = 10
+    room = grid_room(width, height, sen_x, sen_y, sen_r)
 #    for i in range(10):
 #        print('Episode', i)
 #        episode(room)
-    square(room, 50)
+    # 1 person every 3 seconds, 10 s/frame
+    X, M, Y = square(room, sen_x, sen_y, pers_freq=0.33, steps=100, maxtp=32,
+                     history=8, dt=10, timescale=0.1)
