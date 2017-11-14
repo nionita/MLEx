@@ -5,10 +5,16 @@ Created on Tue Nov 14 09:56:32 2017
 @author: nicu
 """
 
+import argparse
+import os
+import sys
 import math
 import random
 import numpy as np
 import cv2
+import tensorflow as tf
+
+FLAGS = None
 
 """
 Coordinates are screen-like, i.e. x=0, y=0 is top, left corner
@@ -220,7 +226,7 @@ def square(room, sen_x, sen_y, pers_freq, steps=1000, maxtp=32, history=16, draw
         hX.append(deta)
     rest = np.random.poisson(lam=ptime)
     for i in range(steps):
-        if i % 10 == 0:
+        if i % 100 == 0:
             print('step', i)
         rest -= dt
         if rest < 0:
@@ -245,7 +251,6 @@ def square(room, sen_x, sen_y, pers_freq, steps=1000, maxtp=32, history=16, draw
                 # Ground truth (this one is traced)
                 Y[i, k, 0] = p.x
                 Y[i, k, 1] = p.y
-        #print('GT ok')
         if det == []:
             deta = np.zeros((sen_x, sen_y), dtype=np.float32)
         else:
@@ -253,12 +258,7 @@ def square(room, sen_x, sen_y, pers_freq, steps=1000, maxtp=32, history=16, draw
             deta = np.reshape(deta, (sen_x, sen_y))
         hX.append(deta)
         hX = hX[1:]
-        #print('deta ok')
-#        # Debug:
-#        for h in hX:
-#            print(h.shape)
         X[i, :, :, :] = np.stack(hX, axis=2)
-        #print('stack ok')
         M[i, :] = pmask
         if draw:
             cimg = rimg.copy()
@@ -274,14 +274,42 @@ def square(room, sen_x, sen_y, pers_freq, steps=1000, maxtp=32, history=16, draw
             elif k is not None:
                 # Delete from mask if traced
                 pmask[k] = 0.
-        #print('pmask ok')
         persons = rps
         if draw and len(persons) != lp:
             lp = len(persons)
             print(lp, 'persons')
     return X, M, Y
 
-if __name__ == '__main__':
+def _int64_feature(value):
+    return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
+
+def _bytes_feature(value):
+    return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+
+def write_to(X, M, Y, name, i):
+    """Writes to tfrecords"""
+    samples, sen_x, sen_y, hist = X.shape
+    maxtp = M.shape[1]
+
+    filename = os.path.join(FLAGS.directory, name + '_{:03d}.tfrecords'.format(i))
+    print('Writing', filename)
+    writer = tf.python_io.TFRecordWriter(filename)
+    for index in range(samples):
+        X_raw = X[index].tostring()
+        M_raw = M[index].tostring()
+        Y_raw = Y[index].tostring()
+        example = tf.train.Example(features=tf.train.Features(feature={
+            'sen_x': _int64_feature(sen_x),
+            'sen_y': _int64_feature(sen_y),
+            'hist': _int64_feature(hist),
+            'maxtp': _int64_feature(maxtp),
+            'M_raw': _bytes_feature(M_raw),
+            'Y_raw': _bytes_feature(Y_raw),
+            'X_raw': _bytes_feature(X_raw)}))
+        writer.write(example.SerializeToString())
+    writer.close()
+
+def main(unused_args):
 #    #room = rand_room(100, 150, 100, 15)
     # 100mx50m area with 72 sensors (grid)
     width = 100
@@ -293,6 +321,39 @@ if __name__ == '__main__':
 #    for i in range(10):
 #        print('Episode', i)
 #        episode(room)
-    # 1 person every 3 seconds, 10 s/frame
-    X, M, Y = square(room, sen_x, sen_y, pers_freq=0.33, steps=100, maxtp=32,
-                     history=8, dt=10, timescale=0.1)
+    for i in range(10):
+        # 1 person every 3 seconds, 10 s/frame
+        X, M, Y = square(room, sen_x, sen_y, pers_freq=0.33, steps=1000, maxtp=32,
+                         history=8, dt=10, timescale=0.1)
+        write_to(X, M, Y, 'train', i)
+    for i in range(2):
+        # 1 person every 3 seconds, 10 s/frame
+        X, M, Y = square(room, sen_x, sen_y, pers_freq=0.33, steps=1000, maxtp=32,
+                         history=8, dt=10, timescale=0.1)
+        write_to(X, M, Y, 'dev', i)
+    for i in range(2):
+        # 1 person every 3 seconds, 10 s/frame
+        X, M, Y = square(room, sen_x, sen_y, pers_freq=0.33, steps=1000, maxtp=32,
+                         history=8, dt=10, timescale=0.1)
+        write_to(X, M, Y, 'test', i)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--directory',
+        type=str,
+        default='./data',
+        help='Directory to write the train/test data files'
+    )
+    parser.add_argument(
+        '--validation_size',
+        type=int,
+        default=5000,
+        help="""\
+        Number of examples to separate from the training data for the validation
+        set.\
+        """
+    )
+    FLAGS, unparsed = parser.parse_known_args()
+    #tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)
+    main([sys.argv[0]] + unparsed)
