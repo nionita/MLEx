@@ -7,12 +7,13 @@ Created on Tue Nov 14 09:56:32 2017
 
 import argparse
 import os
-import sys
+import glob
 import math
 import random
 import numpy as np
 import cv2
 import tensorflow as tf
+import matplotlib.pyplot as plt
 
 FLAGS = None
 
@@ -280,13 +281,16 @@ def square(room, sen_x, sen_y, pers_freq, steps=1000, maxtp=32, history=16, draw
             print(lp, 'persons')
     return X, M, Y
 
+"""
+Next functions deal with coding, writing and decoding TFRecord files
+"""
 def _int64_feature(value):
     return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
 
 def _bytes_feature(value):
     return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
 
-def write_to(X, M, Y, name, i):
+def write_tfrecords(X, M, Y, name, i):
     """Writes to tfrecords"""
     samples, sen_x, sen_y, hist = X.shape
     maxtp = M.shape[1]
@@ -309,6 +313,168 @@ def write_to(X, M, Y, name, i):
         writer.write(example.SerializeToString())
     writer.close()
 
+def decode_tfrecord(serialized):
+    features = tf.parse_single_example(serialized,
+                       features={
+                               #'maxtp': tf.FixedLenFeature([], tf.int64),
+                               'M_raw': tf.FixedLenFeature([], tf.string),
+                               'Y_raw': tf.FixedLenFeature([], tf.string),
+                               'X_raw': tf.FixedLenFeature([], tf.string),
+                       })
+    #maxtp = features['maxtp']
+    M = tf.decode_raw(features['M_raw'], tf.float32)
+    Y = tf.decode_raw(features['Y_raw'], tf.float32)
+    #Y = tf.reshape(Y, [maxtp, 2])
+    X = tf.decode_raw(features['X_raw'], tf.float32)
+    M = tf.reshape(M, [-1])
+    Y = tf.reshape(Y, [-1])
+    X = tf.reshape(X, [-1])
+    return M, Y, X
+
+"""
+Train a DNN for our square peaople problem
+"""
+def train_dnn(maxtp, sens, lr=0.001, mw=10, batch_sz=32, shuffle_sz=2000, max_steps=10000, steps_validate=100):
+    tf.reset_default_graph()
+
+    # Prepare 2 datasets, train & dev
+    train_files = glob.glob(os.path.join(FLAGS.directory, 'train_*.tfrecords'))
+    train_ds = tf.contrib.data.TFRecordDataset(train_files).map(decode_tfrecord)
+    train_ds = train_ds.shuffle(buffer_size=shuffle_sz).batch(batch_sz).repeat()
+
+    dev_files = glob.glob(os.path.join(FLAGS.directory, 'dev_*.tfrecords'))
+    dev_ds = tf.contrib.data.TFRecordDataset(dev_files).map(decode_tfrecord).batch(batch_sz)
+    # Make a compatible feedable iterator for generic use
+    handle = tf.placeholder(tf.string, shape=[])
+    iterator = tf.contrib.data.Iterator.from_string_handle(
+            handle, train_ds.output_types, train_ds.output_shapes)
+    # Create 2 iterators for train and dev
+    train_iter = train_ds.make_initializable_iterator()
+    dev_iter = dev_ds.make_initializable_iterator()
+
+    # Here we build our graph
+    # This is the input of our network
+    with tf.name_scope('input'):
+        mask, y, sensors = iterator.get_next()
+        mask.set_shape([None, maxtp])
+        y.set_shape([None, maxtp * 2])
+        sensors.set_shape([None, sens])
+
+    is_training=tf.placeholder(dtype=tf.bool, shape=[])
+
+    # FC layers
+    with tf.name_scope('layers'):
+        fc1 = tf.contrib.layers.fully_connected(sensors, 128)
+        dr1 = tf.contrib.layers.dropout(fc1, keep_prob=0.2, is_training=is_training)
+        fc2 = tf.contrib.layers.fully_connected(dr1, 128)
+        dr2 = tf.contrib.layers.dropout(fc2, keep_prob=0.2, is_training=is_training)
+        fc3 = tf.contrib.layers.fully_connected(dr2, 128)
+        dr3 = tf.contrib.layers.dropout(fc3, keep_prob=0.2, is_training=is_training)
+        fcr = tf.contrib.layers.fully_connected(dr3, maxtp * 3)
+
+    with tf.name_scope('loss'):
+        # Split to form mask and y estimates
+        emask, ey = tf.split(fcr, [maxtp, maxtp * 2], axis=1)
+        # Estimated mask is like multi label classification
+        mloss = mw * tf.reduce_mean(tf.reduce_sum(tf.nn.sigmoid_cross_entropy_with_logits(labels=mask, logits=emask)))
+        # Position error, weighted by the mask
+        y = tf.reshape(y, [-1, maxtp, 2])
+        ey = tf.reshape(ey, [-1, maxtp, 2])
+        dy = tf.reduce_sum(tf.square(y - ey), axis=2)
+        esigm = tf.sigmoid(emask)
+        yloss = tf.reduce_mean(tf.reduce_sum(tf.multiply(esigm, dy), axis=1))
+        # Total loss
+        loss = tf.add(yloss, mloss)
+
+        # Summaries:
+        tf.summary.scalar('loss', loss)
+        tf.summary.scalar('mloss', mloss)
+        tf.summary.scalar('yloss', yloss)
+
+        merged = tf.summary.merge_all()
+        train_writer = tf.summary.FileWriter(FLAGS.save + '/summ_train', tf.get_default_graph())
+        test_writer = tf.summary.FileWriter(FLAGS.save + '/summ_test')
+
+    # Optimizer, init
+    train_op = tf.train.AdamOptimizer(learning_rate=lr).minimize(loss)
+    init_op = tf.global_variables_initializer()
+
+    # Saver
+    vars = tf.get_collection(tf.GraphKeys.MODEL_VARIABLES)
+    saver = tf.train.Saver(vars, pad_step_number=True)
+
+    with tf.Session() as sess:
+        train_handle = sess.run(train_iter.string_handle())
+        dev_handle = sess.run(dev_iter.string_handle())
+
+        sess.run(init_op)
+        coord = tf.train.Coordinator()
+        threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+
+        # Initializer for input iteration
+        sess.run(train_iter.initializer)
+
+        ## Test:
+        #X = sess.run(sensors, feed_dict={handle: train_handle})
+        #print(X.shape)
+        vls = []
+        vels = []
+        vyls = []
+        tls = []
+
+        cost_train = 0
+        batch_train = 0
+        for step in range(max_steps):
+            #print('Step', step)
+            if step > 0 and step % steps_validate == 0:
+                saver.save(sess=sess, global_step=step, save_path=FLAGS.save + '/checkpoint')
+                cost_train = cost_train / batch_train
+                tls.append(cost_train)
+                cost_train = 0
+                batch_train = 0
+
+                sess.run(dev_iter.initializer)
+                loss_dev = 0
+                eloss_dev = 0
+                yloss_dev = 0
+                batch_dev = 0
+                while True:
+                    try:
+                        # This will take input from dev dataset
+                        vloss, veloss, vyloss, summary = sess.run([loss, mloss, yloss, merged], feed_dict={handle: dev_handle, is_training: False})
+                        # Run the validation here
+                        loss_dev += vloss
+                        eloss_dev += veloss
+                        yloss_dev += vyloss
+                        batch_dev += 1
+                        test_writer.add_summary(summary, step)
+                    except tf.errors.OutOfRangeError:
+                        break
+                loss_dev = loss_dev / batch_dev
+                eloss_dev = eloss_dev / batch_dev
+                yloss_dev = yloss_dev / batch_dev
+                print('Step', step, ': dev error =', loss_dev)
+                vls.append(loss_dev)
+                vels.append(eloss_dev)
+                vyls.append(yloss_dev)
+
+            _, tl, summary = sess.run([train_op, loss, merged], feed_dict={handle: train_handle, is_training: True})
+            train_writer.add_summary(summary, step)
+            cost_train += tl
+            batch_train += 1
+            #print('Train step', step, ':', M.shape, Y.shape, X.shape, M)
+
+        coord.request_stop()
+        coord.join(threads)
+
+    plt.plot(tls, label='Training')
+    plt.plot(vls, label='Validation total')
+    plt.plot(vels, label='Validation mask')
+    plt.plot(vyls, label='Validation dist')
+    plt.title('Train/Validation Loss')
+    plt.legend()
+    plt.show()
+
 def main(unused_args):
 #    #room = rand_room(100, 150, 100, 15)
     # 100mx50m area with 72 sensors (grid)
@@ -325,17 +491,17 @@ def main(unused_args):
         # 1 person every 3 seconds, 10 s/frame
         X, M, Y = square(room, sen_x, sen_y, pers_freq=0.33, steps=1000, maxtp=32,
                          history=8, dt=10, timescale=0.1)
-        write_to(X, M, Y, 'train', i)
+        write_tfrecords(X, M, Y, 'train', i)
     for i in range(2):
         # 1 person every 3 seconds, 10 s/frame
         X, M, Y = square(room, sen_x, sen_y, pers_freq=0.33, steps=1000, maxtp=32,
                          history=8, dt=10, timescale=0.1)
-        write_to(X, M, Y, 'dev', i)
+        write_tfrecords(X, M, Y, 'dev', i)
     for i in range(2):
         # 1 person every 3 seconds, 10 s/frame
         X, M, Y = square(room, sen_x, sen_y, pers_freq=0.33, steps=1000, maxtp=32,
                          history=8, dt=10, timescale=0.1)
-        write_to(X, M, Y, 'test', i)
+        write_tfrecords(X, M, Y, 'test', i)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -344,6 +510,12 @@ if __name__ == '__main__':
         type=str,
         default='./data',
         help='Directory to write the train/test data files'
+    )
+    parser.add_argument(
+        '--save',
+        type=str,
+        default='./save3',
+        help='Directory to save the training result files'
     )
     parser.add_argument(
         '--validation_size',
@@ -355,5 +527,4 @@ if __name__ == '__main__':
         """
     )
     FLAGS, unparsed = parser.parse_known_args()
-    #tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)
-    main([sys.argv[0]] + unparsed)
+    train_dnn(maxtp=32, sens=576, lr=1E-4, mw=100, max_steps=200000, steps_validate=1000)
