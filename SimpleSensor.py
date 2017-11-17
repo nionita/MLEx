@@ -356,9 +356,9 @@ def train_cnn(maxtp, sen_x, sen_y, hist, kp=0.5, lr=0.001, batch_sz=80, shuffle_
 
     with tf.name_scope('cnn'):
         # Convolution layers:
-        co1 = tf.contrib.layers.conv2d(sensors, 16, 3)
+        co1 = tf.contrib.layers.conv2d(sensors, 8, 3)
         mp1 = tf.contrib.layers.max_pool2d(co1, 3, stride=3)
-        co2 = tf.contrib.layers.conv2d(mp1, 32, 3)
+        co2 = tf.contrib.layers.conv2d(mp1, 16, 3)
         mp2 = tf.contrib.layers.max_pool2d(co2, 2, stride=2)
         # FC layers & dropouts
         fl = tf.contrib.layers.flatten(mp2)
@@ -517,7 +517,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--save',
         type=str,
-        default='./save_c0',
+        default='./save_c1',
         help='Directory to save the training result files'
     )
     parser.add_argument(
@@ -540,4 +540,4 @@ if __name__ == '__main__':
     )
     FLAGS, unparsed = parser.parse_known_args()
     #main(unparsed)
-    train_cnn(maxtp=32, sen_x=12, sen_y=6, hist=12, kp=0.6, lr=1E-6)
+    train_cnn(maxtp=32, sen_x=12, sen_y=6, hist=12, kp=0.6, lr=1E-5)
