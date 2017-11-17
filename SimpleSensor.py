@@ -321,14 +321,12 @@ def decode_tfrecord(serialized):
                        })
     M = tf.decode_raw(features['M_raw'], tf.float32)
     X = tf.decode_raw(features['X_raw'], tf.float32)
-    #M = tf.reshape(M, [-1])
-    #X = tf.reshape(X, [-1])
     return M, X
 
 """
-Train a DNN for our square people problem
+Train a CNN for our square people problem - only count
 """
-def train_dnn(maxtp, sens, layers, kp=0.5, lr=0.001, batch_sz=80, shuffle_sz=5000):
+def train_cnn(maxtp, sen_x, sen_y, hist, kp=0.5, lr=0.001, batch_sz=80, shuffle_sz=5000):
     tf.reset_default_graph()
 
     # Prepare 2 datasets, train & dev
@@ -349,22 +347,25 @@ def train_dnn(maxtp, sens, layers, kp=0.5, lr=0.001, batch_sz=80, shuffle_sz=500
     # Here we build our graph
     # This is the input of our network
     with tf.name_scope('input'):
-        mask, sensors = iterator.get_next()
+        mask, senflat = iterator.get_next()
         mask.set_shape([None, maxtp])
-        sensors.set_shape([None, sens])
+        senflat.set_shape([None, sen_x * sen_y * hist])
+        sensors = tf.reshape(senflat, [-1, sen_x, sen_y, hist])
 
     is_training=tf.placeholder(dtype=tf.bool, shape=[])
 
-    # FC layers
-    with tf.name_scope('layers'):
-        # Intermediate fully connected layers with dropout
-        last = sensors
-        for k in layers:
-            fc = tf.contrib.layers.fully_connected(last, k)
-            dr = tf.contrib.layers.dropout(fc, keep_prob=kp, is_training=is_training)
-            last = dr
+    with tf.name_scope('cnn'):
+        # Convolution layers:
+        co1 = tf.contrib.layers.conv2d(sensors, 16, 3)
+        mp1 = tf.contrib.layers.max_pool2d(co1, 3, stride=3)
+        co2 = tf.contrib.layers.conv2d(mp1, 32, 3)
+        mp2 = tf.contrib.layers.max_pool2d(co2, 2, stride=2)
+        # FC layers & dropouts
+        fl = tf.contrib.layers.flatten(mp2)
+        fc1 = tf.contrib.layers.fully_connected(fl, 32)
+        dr1 = tf.contrib.layers.dropout(fc1, keep_prob=kp, is_training=is_training)
         # Final layer
-        fcr = tf.contrib.layers.fully_connected(last, maxtp+1, activation_fn=None)
+        fcr = tf.contrib.layers.fully_connected(dr1, maxtp+1, activation_fn=None)
 
     with tf.name_scope('loss'):
         # Ground truth is the sum of the mask (number of tracked people)
@@ -516,7 +517,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--save',
         type=str,
-        default='./save_8',
+        default='./save_c0',
         help='Directory to save the training result files'
     )
     parser.add_argument(
@@ -539,4 +540,4 @@ if __name__ == '__main__':
     )
     FLAGS, unparsed = parser.parse_known_args()
     #main(unparsed)
-    train_dnn(maxtp=32, sens=864, layers=[64], kp=0.6, lr=1E-6)
+    train_cnn(maxtp=32, sen_x=12, sen_y=6, hist=12, kp=0.6, lr=1E-6)
