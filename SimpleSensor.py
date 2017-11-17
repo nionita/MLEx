@@ -87,7 +87,7 @@ class Room():
             if a:
                 cx, cy = self.img_coord(s.x, s.y)
                 cv2.circle(img, (cx, cy), 3, (10, 255, 20), -1)
-        for p in ps:
+        for p, _ in ps:
             cx, cy = self.img_coord(p.x, p.y)
             cv2.circle(img, (cx, cy), 5, (0, 0, 255), -1)
 
@@ -209,12 +209,11 @@ def square(room, sen_x, sen_y, pers_freq, steps=1000, maxtp=32, history=16, draw
     # due to how the person generation works
     ptime = 1. / pers_freq
     # This is the simulation step time
-    dt = dt * timescale
     persons = []
     if draw:
         lp = 0
         rimg = room.draw()
-        dtms = int(dt * 1000)
+        dtms = int(dt * 1000 * timescale)
     # Tensors to collect data: person mask (valid persons), sensor reading
     # and ground truth, which keeps the position (x, y) per tracked person
     M = np.zeros((steps, maxtp), dtype=np.float32)
@@ -227,7 +226,7 @@ def square(room, sen_x, sen_y, pers_freq, steps=1000, maxtp=32, history=16, draw
         hX.append(deta)
     rest = np.random.poisson(lam=ptime)
     for i in range(steps):
-        if i % 100 == 0:
+        if i % 200 == 0:
             print('step', i)
         rest -= dt
         if rest < 0:
@@ -313,28 +312,23 @@ def write_tfrecords(X, M, Y, name, i):
         writer.write(example.SerializeToString())
     writer.close()
 
+# If we want only to count the persons we do not need the positions (Y)
 def decode_tfrecord(serialized):
     features = tf.parse_single_example(serialized,
                        features={
-                               #'maxtp': tf.FixedLenFeature([], tf.int64),
                                'M_raw': tf.FixedLenFeature([], tf.string),
-                               'Y_raw': tf.FixedLenFeature([], tf.string),
                                'X_raw': tf.FixedLenFeature([], tf.string),
                        })
-    #maxtp = features['maxtp']
     M = tf.decode_raw(features['M_raw'], tf.float32)
-    Y = tf.decode_raw(features['Y_raw'], tf.float32)
-    #Y = tf.reshape(Y, [maxtp, 2])
     X = tf.decode_raw(features['X_raw'], tf.float32)
-    M = tf.reshape(M, [-1])
-    Y = tf.reshape(Y, [-1])
-    X = tf.reshape(X, [-1])
-    return M, Y, X
+    #M = tf.reshape(M, [-1])
+    #X = tf.reshape(X, [-1])
+    return M, X
 
 """
-Train a DNN for our square peaople problem
+Train a DNN for our square people problem
 """
-def train_dnn(maxtp, sens, lr=0.001, mw=10, batch_sz=32, shuffle_sz=2000, max_steps=10000, steps_validate=100):
+def train_dnn(maxtp, sens, layers, kp=0.5, lr=0.001, batch_sz=80, shuffle_sz=5000):
     tf.reset_default_graph()
 
     # Prepare 2 datasets, train & dev
@@ -355,41 +349,36 @@ def train_dnn(maxtp, sens, lr=0.001, mw=10, batch_sz=32, shuffle_sz=2000, max_st
     # Here we build our graph
     # This is the input of our network
     with tf.name_scope('input'):
-        mask, y, sensors = iterator.get_next()
+        mask, sensors = iterator.get_next()
         mask.set_shape([None, maxtp])
-        y.set_shape([None, maxtp * 2])
         sensors.set_shape([None, sens])
 
     is_training=tf.placeholder(dtype=tf.bool, shape=[])
 
     # FC layers
     with tf.name_scope('layers'):
-        fc1 = tf.contrib.layers.fully_connected(sensors, 128)
-        dr1 = tf.contrib.layers.dropout(fc1, keep_prob=0.2, is_training=is_training)
-        fc2 = tf.contrib.layers.fully_connected(dr1, 128)
-        dr2 = tf.contrib.layers.dropout(fc2, keep_prob=0.2, is_training=is_training)
-        fc3 = tf.contrib.layers.fully_connected(dr2, 128)
-        dr3 = tf.contrib.layers.dropout(fc3, keep_prob=0.2, is_training=is_training)
-        fcr = tf.contrib.layers.fully_connected(dr3, maxtp * 3)
+        # Intermediate fully connected layers with dropout
+        last = sensors
+        for k in layers:
+            fc = tf.contrib.layers.fully_connected(last, k)
+            dr = tf.contrib.layers.dropout(fc, keep_prob=kp, is_training=is_training)
+            last = dr
+        # Final layer
+        fcr = tf.contrib.layers.fully_connected(last, maxtp+1, activation_fn=None)
 
     with tf.name_scope('loss'):
-        # Split to form mask and y estimates
-        emask, ey = tf.split(fcr, [maxtp, maxtp * 2], axis=1)
-        # Estimated mask is like multi label classification
-        mloss = mw * tf.reduce_mean(tf.reduce_sum(tf.nn.sigmoid_cross_entropy_with_logits(labels=mask, logits=emask)))
-        # Position error, weighted by the mask
-        y = tf.reshape(y, [-1, maxtp, 2])
-        ey = tf.reshape(ey, [-1, maxtp, 2])
-        dy = tf.reduce_sum(tf.square(y - ey), axis=2)
-        esigm = tf.sigmoid(emask)
-        yloss = tf.reduce_mean(tf.reduce_sum(tf.multiply(esigm, dy), axis=1))
-        # Total loss
-        loss = tf.add(yloss, mloss)
+        # Ground truth is the sum of the mask (number of tracked people)
+        y = tf.reduce_sum(mask, axis=1)
+        yoh = tf.contrib.layers.one_hot_encoding(tf.cast(y, tf.int32), maxtp+1)
+        # Prediction
+        topi = tf.cast(tf.argmax(tf.nn.softmax(fcr), axis=1), tf.float32)
+        # Weight with squared class distance (+1: for same class, just normal classification cost)
+        ws = tf.div(tf.losses.mean_squared_error(y, topi, reduction=tf.losses.Reduction.NONE) + 1, y + 1)
+        loss = tf.losses.softmax_cross_entropy(yoh, fcr, ws)
+        #print(y.shape, yoh.shape, topi.shape, ws.shape)
 
         # Summaries:
         tf.summary.scalar('loss', loss)
-        tf.summary.scalar('mloss', mloss)
-        tf.summary.scalar('yloss', yloss)
 
         merged = tf.summary.merge_all()
         train_writer = tf.summary.FileWriter(FLAGS.save + '/summ_train', tf.get_default_graph())
@@ -418,15 +407,13 @@ def train_dnn(maxtp, sens, lr=0.001, mw=10, batch_sz=32, shuffle_sz=2000, max_st
         #X = sess.run(sensors, feed_dict={handle: train_handle})
         #print(X.shape)
         vls = []
-        vels = []
-        vyls = []
         tls = []
 
         cost_train = 0
         batch_train = 0
-        for step in range(max_steps):
+        for step in range(FLAGS.train_steps):
             #print('Step', step)
-            if step > 0 and step % steps_validate == 0:
+            if step > 0 and step % FLAGS.val_steps == 0:
                 saver.save(sess=sess, global_step=step, save_path=FLAGS.save + '/checkpoint')
                 cost_train = cost_train / batch_train
                 tls.append(cost_train)
@@ -435,42 +422,44 @@ def train_dnn(maxtp, sens, lr=0.001, mw=10, batch_sz=32, shuffle_sz=2000, max_st
 
                 sess.run(dev_iter.initializer)
                 loss_dev = 0
-                eloss_dev = 0
-                yloss_dev = 0
+                accurate = 0
                 batch_dev = 0
+                examp = False
                 while True:
                     try:
                         # This will take input from dev dataset
-                        vloss, veloss, vyloss, summary = sess.run([loss, mloss, yloss, merged], feed_dict={handle: dev_handle, is_training: False})
+                        pred, truth, vloss, summary = sess.run([fcr, yoh, loss, merged], feed_dict={handle: dev_handle, is_training: False})
                         # Run the validation here
+                        yi = np.argmax(truth, axis=1)
+                        pi = np.argmax(pred, axis=1)
+                        ok = (pi == yi)
+                        accurate += np.sum(ok)
+                        if not examp and np.random.rand() < 0.005:
+                            print('True =', yi)
+                            print('Pred =', pi)
+                            examp = True
+                        n = pred.shape[0]
+                        batch_dev += n
                         loss_dev += vloss
-                        eloss_dev += veloss
-                        yloss_dev += vyloss
-                        batch_dev += 1
                         test_writer.add_summary(summary, step)
                     except tf.errors.OutOfRangeError:
                         break
                 loss_dev = loss_dev / batch_dev
-                eloss_dev = eloss_dev / batch_dev
-                yloss_dev = yloss_dev / batch_dev
-                print('Step', step, ': dev error =', loss_dev)
+                acc = accurate / batch_dev
+                print('Step', step, ': dev error =', loss_dev, 'accuracy:', acc)
                 vls.append(loss_dev)
-                vels.append(eloss_dev)
-                vyls.append(yloss_dev)
 
-            _, tl, summary = sess.run([train_op, loss, merged], feed_dict={handle: train_handle, is_training: True})
+            _, pred, tl, summary = sess.run([train_op, fcr, loss, merged], feed_dict={handle: train_handle, is_training: True})
             train_writer.add_summary(summary, step)
+            n = pred.shape[0]
+            batch_train += n
             cost_train += tl
-            batch_train += 1
-            #print('Train step', step, ':', M.shape, Y.shape, X.shape, M)
 
         coord.request_stop()
         coord.join(threads)
 
     plt.plot(tls, label='Training')
-    plt.plot(vls, label='Validation total')
-    plt.plot(vels, label='Validation mask')
-    plt.plot(vyls, label='Validation dist')
+    plt.plot(vls, label='Validation')
     plt.title('Train/Validation Loss')
     plt.legend()
     plt.show()
@@ -487,21 +476,34 @@ def main(unused_args):
 #    for i in range(10):
 #        print('Episode', i)
 #        episode(room)
-    for i in range(10):
-        # 1 person every 3 seconds, 10 s/frame
-        X, M, Y = square(room, sen_x, sen_y, pers_freq=0.33, steps=1000, maxtp=32,
-                         history=8, dt=10, timescale=0.1)
-        write_tfrecords(X, M, Y, 'train', i)
-    for i in range(2):
-        # 1 person every 3 seconds, 10 s/frame
-        X, M, Y = square(room, sen_x, sen_y, pers_freq=0.33, steps=1000, maxtp=32,
-                         history=8, dt=10, timescale=0.1)
-        write_tfrecords(X, M, Y, 'dev', i)
-    for i in range(2):
-        # 1 person every 3 seconds, 10 s/frame
-        X, M, Y = square(room, sen_x, sen_y, pers_freq=0.33, steps=1000, maxtp=32,
-                         history=8, dt=10, timescale=0.1)
-        write_tfrecords(X, M, Y, 'test', i)
+#    X, M, Y = square(room, sen_x, sen_y, draw=True, pers_freq=0.1, steps=1000, maxtp=32,
+#                     history=8, dt=1, timescale=0.1)
+    hlen = 12
+    maxtp = 32
+    steps = 1000
+    fret = 1
+    print('X flat:', sen_x * sen_y * hlen)
+    # Different persons frequencies, 1s/frame, training/dev/test data
+    itr = 0
+    idv = 0
+    ite = 0
+    for pf in [1/3, 1/4, 1/5, 1/6, 1/7, 1/8, 1/9, 1/10]:
+        print('Freq:', pf)
+        for _ in range(10):
+            X, M, Y = square(room, sen_x, sen_y, pers_freq=pf, steps=steps, maxtp=maxtp,
+                             history=hlen, dt=fret)
+            write_tfrecords(X, M, Y, 'train', itr)
+            itr += 1
+        for _ in range(2):
+            X, M, Y = square(room, sen_x, sen_y, pers_freq=pf, steps=steps, maxtp=maxtp,
+                             history=hlen, dt=fret)
+            write_tfrecords(X, M, Y, 'dev', idv)
+            idv += 1
+        for _ in range(2):
+            X, M, Y = square(room, sen_x, sen_y, pers_freq=pf, steps=steps, maxtp=maxtp,
+                             history=hlen, dt=fret)
+            write_tfrecords(X, M, Y, 'test', ite)
+            ite += 1
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -514,17 +516,27 @@ if __name__ == '__main__':
     parser.add_argument(
         '--save',
         type=str,
-        default='./save3',
+        default='./save_8',
         help='Directory to save the training result files'
     )
     parser.add_argument(
-        '--validation_size',
+        '--train_steps',
         type=int,
-        default=5000,
+        default=300000,
         help="""\
-        Number of examples to separate from the training data for the validation
+        Number of training steps
+        set.\
+        """
+    )
+    parser.add_argument(
+        '--val_steps',
+        type=int,
+        default=1000,
+        help="""\
+        Number of training steps after which a validation occurs
         set.\
         """
     )
     FLAGS, unparsed = parser.parse_known_args()
-    train_dnn(maxtp=32, sens=576, lr=1E-4, mw=100, max_steps=200000, steps_validate=1000)
+    #main(unparsed)
+    train_dnn(maxtp=32, sens=864, layers=[64], kp=0.6, lr=1E-6)
