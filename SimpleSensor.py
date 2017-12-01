@@ -13,7 +13,7 @@ import random
 import numpy as np
 import cv2
 import tensorflow as tf
-import matplotlib.pyplot as plt
+#import matplotlib.pyplot as plt
 
 FLAGS = None
 
@@ -326,7 +326,7 @@ def decode_tfrecord(serialized):
 """
 Train a CNN for our square people problem - only count
 """
-def train_cnn(maxtp, sen_x, sen_y, hist, kp=0.5, lr=0.001, batch_sz=80, shuffle_sz=5000):
+def train_cnn(maxtp, sen_x, sen_y, hist, kp=0.5, lr=0.001, batch_sz=50, shuffle_sz=25000):
     tf.reset_default_graph()
 
     # Prepare 2 datasets, train & dev
@@ -423,6 +423,7 @@ def train_cnn(maxtp, sen_x, sen_y, hist, kp=0.5, lr=0.001, batch_sz=80, shuffle_
 
                 sess.run(dev_iter.initializer)
                 loss_dev = 0
+                sqrsum   = 0
                 accurate = 0
                 batch_dev = 0
                 examp = False
@@ -435,6 +436,8 @@ def train_cnn(maxtp, sen_x, sen_y, hist, kp=0.5, lr=0.001, batch_sz=80, shuffle_
                         pi = np.argmax(pred, axis=1)
                         ok = (pi == yi)
                         accurate += np.sum(ok)
+                        df = pi - yi
+                        sqrsum += np.dot(df, df)
                         if not examp and np.random.rand() < 0.005:
                             print('True =', yi)
                             print('Pred =', pi)
@@ -447,7 +450,8 @@ def train_cnn(maxtp, sen_x, sen_y, hist, kp=0.5, lr=0.001, batch_sz=80, shuffle_
                         break
                 loss_dev = loss_dev / batch_dev
                 acc = accurate / batch_dev
-                print('Step', step, ': dev error =', loss_dev, 'accuracy:', acc)
+                std = math.sqrt(sqrsum / batch_dev)
+                print('Step', step, ': dev error =', loss_dev, 'accuracy:', acc, 'std err:', std)
                 vls.append(loss_dev)
 
             _, pred, tl, summary = sess.run([train_op, fcr, loss, merged], feed_dict={handle: train_handle, is_training: True})
@@ -459,11 +463,11 @@ def train_cnn(maxtp, sen_x, sen_y, hist, kp=0.5, lr=0.001, batch_sz=80, shuffle_
         coord.request_stop()
         coord.join(threads)
 
-    plt.plot(tls, label='Training')
-    plt.plot(vls, label='Validation')
-    plt.title('Train/Validation Loss')
-    plt.legend()
-    plt.show()
+#    plt.plot(tls, label='Training')
+#    plt.plot(vls, label='Validation')
+#    plt.title('Train/Validation Loss')
+#    plt.legend()
+#    plt.show()
 
 def main(unused_args):
 #    #room = rand_room(100, 150, 100, 15)
@@ -483,35 +487,35 @@ def main(unused_args):
     maxtp = 32
     steps = 1000
     fret = 1
-    print('X flat:', sen_x * sen_y * hlen)
     # Different persons frequencies, 1s/frame, training/dev/test data
     itr = 0
     idv = 0
     ite = 0
-    for pf in [1/3, 1/4, 1/5, 1/6, 1/7, 1/8, 1/9, 1/10]:
+    for pf in [1/3, 1/4, 1/5, 1/6, 1/7, 1/8, 1/9, 1/10, 1/11, 1/12]:
         print('Freq:', pf)
-        for _ in range(10):
+        for _ in range(100):
             X, M, Y = square(room, sen_x, sen_y, pers_freq=pf, steps=steps, maxtp=maxtp,
                              history=hlen, dt=fret)
             write_tfrecords(X, M, Y, 'train', itr)
             itr += 1
-        for _ in range(2):
+        for _ in range(10):
             X, M, Y = square(room, sen_x, sen_y, pers_freq=pf, steps=steps, maxtp=maxtp,
                              history=hlen, dt=fret)
             write_tfrecords(X, M, Y, 'dev', idv)
             idv += 1
-        for _ in range(2):
+        for _ in range(10):
             X, M, Y = square(room, sen_x, sen_y, pers_freq=pf, steps=steps, maxtp=maxtp,
                              history=hlen, dt=fret)
             write_tfrecords(X, M, Y, 'test', ite)
             ite += 1
+    print('X flat:', sen_x * sen_y * hlen)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--directory',
         type=str,
-        default='./data',
+        default='./data_1M',
         help='Directory to write the train/test data files'
     )
     parser.add_argument(
@@ -523,7 +527,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--train_steps',
         type=int,
-        default=300000,
+        default=100000,
         help="""\
         Number of training steps
         set.\
@@ -540,4 +544,4 @@ if __name__ == '__main__':
     )
     FLAGS, unparsed = parser.parse_known_args()
     #main(unparsed)
-    train_cnn(maxtp=32, sen_x=12, sen_y=6, hist=12, kp=0.6, lr=1E-5)
+    train_cnn(maxtp=32, sen_x=12, sen_y=6, hist=12, kp=0.5, lr=1E-5)
