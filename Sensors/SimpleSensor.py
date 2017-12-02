@@ -355,14 +355,27 @@ def train_cnn(maxtp, sen_x, sen_y, hist, kp=0.5, lr=0.001, batch_sz=50, shuffle_
     is_training=tf.placeholder(dtype=tf.bool, shape=[])
 
     with tf.name_scope('cnn'):
+        # Floyd run 3
+        ## Convolution layers:
+        #co1 = tf.contrib.layers.conv2d(sensors, 8, 3)
+        #mp1 = tf.contrib.layers.max_pool2d(co1, 3, stride=3)
+        #co2 = tf.contrib.layers.conv2d(mp1, 16, 3)
+        #mp2 = tf.contrib.layers.max_pool2d(co2, 2, stride=2)
+        ## FC layers
+        #fl = tf.contrib.layers.flatten(mp2)
+        #fc1 = tf.contrib.layers.fully_connected(fl, 32)
+
+        # Floyd run 4
         # Convolution layers:
-        co1 = tf.contrib.layers.conv2d(sensors, 8, 3)
+        co1 = tf.contrib.layers.conv2d(sensors, 16, 3)
         mp1 = tf.contrib.layers.max_pool2d(co1, 3, stride=3)
         co2 = tf.contrib.layers.conv2d(mp1, 16, 3)
         mp2 = tf.contrib.layers.max_pool2d(co2, 2, stride=2)
-        # FC layers & dropouts
+        # FC layers
         fl = tf.contrib.layers.flatten(mp2)
         fc1 = tf.contrib.layers.fully_connected(fl, 32)
+
+        # Dropout
         dr1 = tf.contrib.layers.dropout(fc1, keep_prob=kp, is_training=is_training)
         # Final layer
         fcr = tf.contrib.layers.fully_connected(dr1, maxtp+1, activation_fn=None)
@@ -515,19 +528,19 @@ if __name__ == '__main__':
     parser.add_argument(
         '--directory',
         type=str,
-        default='./data_1M',
+        default='../data/sensors',
         help='Directory to write the train/test data files'
     )
     parser.add_argument(
         '--save',
         type=str,
-        default='./save_c1',
+        default='../output/sensors/local',
         help='Directory to save the training result files'
     )
     parser.add_argument(
         '--train_steps',
         type=int,
-        default=100000,
+        default=1000,
         help="""\
         Number of training steps
         set.\
@@ -536,7 +549,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--val_steps',
         type=int,
-        default=1000,
+        default=200,
         help="""\
         Number of training steps after which a validation occurs
         set.\
